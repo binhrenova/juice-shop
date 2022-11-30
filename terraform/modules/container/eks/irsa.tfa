@@ -1,0 +1,574 @@
+### Policies and roles need to setup EKS node autoscaling ###
+locals {
+  k8s_ca_service_account_namespace = "platform"
+  k8s_ca_service_account_name      = "cluster-autoscaler-aws-cluster-autoscaler"
+}
+
+module "iam_assumable_role_cluster_autoscaler" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "cluster-autoscaler-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.cluster_autoscaler.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_ca_service_account_namespace}:${local.k8s_ca_service_account_name}"]
+}
+
+resource "aws_iam_policy" "cluster_autoscaler" {
+  name_prefix = "cluster-autoscaler"
+  description = "EKS cluster-autoscaler policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.cluster_autoscaler.json
+}
+
+data "aws_iam_policy_document" "cluster_autoscaler" {
+  statement {
+    sid    = "clusterAutoscalerAll"
+    effect = "Allow"
+
+    actions = [
+      "autoscaling:DescribeAutoScalingGroups",
+      "autoscaling:DescribeAutoScalingInstances",
+      "autoscaling:DescribeLaunchConfigurations",
+      "autoscaling:DescribeTags",
+      "ec2:DescribeLaunchTemplateVersions",
+    ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "clusterAutoscalerOwn"
+    effect = "Allow"
+
+    actions = [
+      "autoscaling:SetDesiredCapacity",
+      "autoscaling:TerminateInstanceInAutoScalingGroup",
+      "autoscaling:UpdateAutoScalingGroup",
+    ]
+
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "autoscaling:ResourceTag/kubernetes.io/cluster/${module.eks_cluster.cluster_id}"
+      values   = ["owned"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "autoscaling:ResourceTag/k8s.io/cluster-autoscaler/enabled"
+      values   = ["true"]
+    }
+  }
+}
+
+### Policies and roles need to setup external-dns ###
+locals {
+  k8s_external_dns_service_account_namespace = "platform"
+  k8s_external_dns_service_account_name      = "external-dns"
+}
+
+# Create a role using oidc to map service accounts
+module "iam_assumable_role_external_dns" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "external-dns-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.external_dns.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_external_dns_service_account_namespace}:${local.k8s_external_dns_service_account_name}"]
+}
+
+resource "aws_iam_policy" "external_dns" {
+  name_prefix = "external-dns"
+  description = "EKS external-dns policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.external_dns_policy_doc.json
+}
+
+data "aws_iam_policy_document" "external_dns_policy_doc" {
+
+  # https://github.com/ministryofjustice/cloud-platform-terraform-external-dns/blob/master/irsa.tf
+  statement {
+    actions   = ["route53:GetChange"]
+    resources = ["arn:aws:route53:::change/*"]
+  }
+
+  statement {
+    sid    = "k8sExternalDnsRead"
+    effect = "Allow"
+
+    actions = [
+      "route53:ListHostedZones",
+      "route53:ListResourceRecordSets",
+    ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "k8sExternalDnsWrite"
+    effect = "Allow"
+
+    actions = ["route53:ChangeResourceRecordSets"]
+
+    resources = ["arn:aws:route53:::hostedzone/*"]
+  }
+}
+
+### Policies and roles need to setup EKS thanos ###
+locals {
+  k8s_thanos_service_account_namespace = "monitoring"
+  k8s_thanos_service_account_name      = "thanos"
+}
+
+module "iam_assumable_role_thanos" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "thanos-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.thanos.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_thanos_service_account_namespace}:${local.k8s_thanos_service_account_name}"]
+}
+
+resource "aws_iam_policy" "thanos" {
+  name_prefix = "thanos"
+  description = "EKS thanos policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.thanos.json
+}
+
+data "aws_iam_policy_document" "thanos" {
+  statement {
+    sid    = "k8sThanosReadWriteBucket"
+    effect = "Allow"
+
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:DeleteObject",
+      "s3:ListMultipartUploadParts",
+      "s3:AbortMultipartUpload"
+    ]
+
+    # resources = ["arn:aws:s3:::${aws_s3_bucket.prometheus-thanos-nashtech.bucket}/*"]
+    resources = ["arn:aws:s3:::prometheus-thanos-nashtech/*"]
+  }
+
+  statement {
+    sid    = "k8sThanosListBucket"
+    effect = "Allow"
+
+    actions = [
+      "s3:ListBucket",
+      "s3:GetBucketLocation",
+      "s3:ListBucketMultipartUploads"
+    ]
+
+    # resources = ["arn:aws:s3:::${aws_s3_bucket.prometheus-thanos-nashtech.bucket}"]
+    resources = ["arn:aws:s3:::prometheus-thanos-nashtech"]
+  }
+}
+
+# ### Policies and roles need to setup EKS vault ###
+# locals {
+#   k8s_vault_service_account_namespace = "platform"
+#   k8s_vault_service_account_name      = "vault"
+# }
+
+# module "iam_assumable_role_vault" {
+#   source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+#   version                       = "~> v4.1.0"
+#   create_role                   = true
+#   role_name                     = "vault-${var.env}"
+#   provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+#   role_policy_arns              = [aws_iam_policy.vault.arn]
+#   oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_vault_service_account_namespace}:${local.k8s_vault_service_account_name}"]
+# }
+
+# resource "aws_iam_policy" "vault" {
+#   name_prefix = "vault"
+#   description = "EKS vault policy for cluster ${module.eks_cluster.cluster_id}"
+#   policy      = data.aws_iam_policy_document.vault.json
+# }
+
+# data "aws_iam_policy_document" "vault" {
+#   statement {
+#     sid    = "Vault"
+#     effect = "Allow"
+
+#     actions = [
+#       "kms:Encrypt",
+#       "kms:Decrypt",
+#       "kms:DescribeKey"
+#     ]
+
+#     resources = [
+#       aws_kms_key.vault.arn
+#       # "*"
+#     ]
+#   }
+# }
+
+# ### Policies and roles need to setup cert-manager ###
+# locals {
+#   k8s_cert_manager_service_account_namespace = "cert-manager"
+#   k8s_cert_manager_service_account_name      = "cert-manager"
+#   external_dns_zone                          = "mydomain.com"
+# }
+
+# # Reference an existing route53 zone
+# # data "aws_route53_zone" "public" {
+# #   name = local.external_dns_zone
+# # }
+
+# # Create a role using oidc to map service accounts
+# module "iam_assumable_role_cert_manager" {
+#   source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+#   version                       = "~> v4.1.0"
+#   create_role                   = true
+#   role_name                     = "cert-manager-${var.env}"
+#   provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+#   role_policy_arns              = [aws_iam_policy.cert_manager.arn]
+#   oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_cert_manager_service_account_namespace}:${local.k8s_cert_manager_service_account_name}"]
+# }
+
+# resource "aws_iam_policy" "cert_manager" {
+#   name_prefix = "cert-manager"
+#   description = "EKS cert-manager policy for cluster ${module.eks_cluster.cluster_id}"
+#   policy      = data.aws_iam_policy_document.cert_manager_policy_doc.json
+# }
+
+# data "aws_iam_policy_document" "cert_manager_policy_doc" {
+#   statement {
+#     sid    = "ListZones"
+#     effect = "Allow"
+
+#     actions = [
+#       "route53:ListHostedZonesByName"
+#     ]
+
+#     resources = ["*"]
+#   }
+
+#   statement {
+#     sid    = "ReadWriteRecordsInZone"
+#     effect = "Allow"
+
+#     actions = [
+#       "route53:ChangeResourceRecordSets",
+#       "route53:ListResourceRecordSets"
+#     ]
+
+#     resources = [
+#       "arn:aws:route53:::hostedzone/${data.aws_route53_zone.${var.env}.zone_id}",
+#       "arn:aws:route53:::hostedzone/Z001003134S2KP9PBTH1C"
+#     ]
+#   }
+
+#   statement {
+#     sid    = "GetChange"
+#     effect = "Allow"
+
+#     actions = [
+#       "route53:GetChange"
+#     ]
+
+#     resources = ["arn:aws:route53:::change/*"]
+#   }
+# }
+
+### Policies and roles need to setup chartmuseum ###
+locals {
+  k8s_chartmuseum_service_account_namespace = "platform"
+  k8s_chartmuseum_service_account_name      = "chartmuseum"
+}
+
+# Create a role using oidc to map service accounts
+module "iam_assumable_role_chartmuseum" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "chartmuseum-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.chartmuseum.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_chartmuseum_service_account_namespace}:${local.k8s_chartmuseum_service_account_name}"]
+}
+
+resource "aws_iam_policy" "chartmuseum" {
+  name_prefix = "chartmuseum"
+  description = "EKS chartmuseum policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.chartmuseum_policy_doc.json
+}
+
+data "aws_iam_policy_document" "chartmuseum_policy_doc" {
+  statement {
+    sid    = "ReadWriteBucketChartMuseum"
+    effect = "Allow"
+
+    actions = [
+      "s3:*"
+    ]
+
+    # resources = ["arn:aws:s3:::${aws_s3_bucket.prometheus-thanos-nashtech.bucket}/*"]
+    resources = [
+      "arn:aws:s3:::kdbb-chartmuseum",
+      "arn:aws:s3:::kdbb-chartmuseum/*"
+    ]
+  }
+}
+
+### Policies and roles need to setup secret-store-csi ###
+locals {
+  k8s_secret_store_csi_service_account_namespace = "platform"
+  k8s_secret_store_csi_service_account_name      = "secret-store-csi"
+}
+
+# Create a role using oidc to map service accounts
+module "iam_assumable_role_secret_store_csi" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "secret-store-csi-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.secret_store_csi.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_secret_store_csi_service_account_namespace}:${local.k8s_secret_store_csi_service_account_name}"]
+}
+
+resource "aws_iam_policy" "secret_store_csi" {
+  name_prefix = "secret_store_csi"
+  description = "EKS Secrets Manager policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.secret_store_csi.json
+}
+
+data "aws_iam_policy_document" "secret_store_csi" {
+  statement {
+    sid    = "SecretsManagerRead"
+    effect = "Allow"
+
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:DescribeSecret",
+      "sts:*",
+    ]
+
+    resources = ["*"]
+  }
+}
+
+### Policies and roles need to setup IRSA EFS CSI Driver ###
+locals {
+  k8s_efs_csi_driver_service_account_namespace = "platform"
+  k8s_efs_csi_driver_service_account_name      = "efs-csi-driver"
+}
+
+# Create a role using oidc to map service accounts
+module "iam_assumable_role_efs_csi_driver" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "efs-csi-driver-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.efs_csi_driver.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_efs_csi_driver_service_account_namespace}:${local.k8s_efs_csi_driver_service_account_name}"]
+}
+
+resource "aws_iam_policy" "efs_csi_driver" {
+  name_prefix = "efs_csi_driver"
+  description = "EKS EFS CSI Driver policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.efs_csi_driver.json
+}
+
+data "aws_iam_policy_document" "efs_csi_driver" {
+  statement {
+    sid    = "EFSDescribeAPnFS"
+    effect = "Allow"
+
+    actions = [
+      "elasticfilesystem:DescribeAccessPoints",
+      "elasticfilesystem:DescribeFileSystems",
+    ]
+
+    resources = ["*"]
+  }
+  statement {
+    sid    = "EFSCreateAP"
+    effect = "Allow"
+
+    actions = [
+      "elasticfilesystem:CreateAccessPoint",
+    ]
+
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+  statement {
+    sid    = "EFSDeleteAP"
+    effect = "Allow"
+
+    actions = [
+      "elasticfilesystem:DeleteAccessPoint",
+    ]
+
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+}
+
+### Policies and roles need to setup IRSA AWS Load Balancer Controller ###
+locals {
+  k8s_aws_load_balancer_controller_service_account_namespace = "platform"
+  k8s_aws_load_balancer_controller_service_account_name      = "aws-load-balancer-controller"
+}
+
+# Create a role using oidc to map service accounts
+module "iam_assumable_role_aws_load_balancer_controller" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "aws-load-balancer-controller-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.aws_load_balancer_controller.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_aws_load_balancer_controller_service_account_namespace}:${local.k8s_aws_load_balancer_controller_service_account_name}"]
+}
+
+resource "aws_iam_policy" "aws_load_balancer_controller" {
+  name_prefix = "aws_load_balancer_controller"
+  description = "EKS AWS Load Balancer Controller policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.aws_load_balancer_controller.json
+}
+
+data "aws_iam_policy_document" "aws_load_balancer_controller" {
+
+  statement {
+    sid    = "albc"
+    effect = "Allow"
+
+    actions = [
+      "iam:CreateServiceLinkedRole",
+      "ec2:DescribeAccountAttributes",
+      "ec2:DescribeAddresses",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeInternetGateways",
+      "ec2:DescribeVpcs",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeInstances",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeTags",
+      "ec2:GetCoipPoolUsage",
+      "ec2:DescribeCoipPools",
+      "elasticloadbalancing:DescribeLoadBalancers",
+      "elasticloadbalancing:DescribeLoadBalancerAttributes",
+      "elasticloadbalancing:DescribeListeners",
+      "elasticloadbalancing:DescribeListenerCertificates",
+      "elasticloadbalancing:DescribeSSLPolicies",
+      "elasticloadbalancing:DescribeRules",
+      "elasticloadbalancing:DescribeTargetGroups",
+      "elasticloadbalancing:DescribeTargetGroupAttributes",
+      "elasticloadbalancing:DescribeTargetHealth",
+      "elasticloadbalancing:DescribeTags",
+      "cognito-idp:DescribeUserPoolClient",
+      "acm:ListCertificates",
+      "acm:DescribeCertificate",
+      "iam:ListServerCertificates",
+      "iam:GetServerCertificate",
+      "waf-regional:GetWebACL",
+      "waf-regional:GetWebACLForResource",
+      "waf-regional:AssociateWebACL",
+      "waf-regional:DisassociateWebACL",
+      "wafv2:GetWebACL",
+      "wafv2:GetWebACLForResource",
+      "wafv2:AssociateWebACL",
+      "wafv2:DisassociateWebACL",
+      "shield:GetSubscriptionState",
+      "shield:DescribeProtection",
+      "shield:CreateProtection",
+      "shield:DeleteProtection",
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:RevokeSecurityGroupIngress",
+      "ec2:CreateSecurityGroup",
+      "ec2:CreateTags",
+      "ec2:DeleteTags",
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:RevokeSecurityGroupIngress",
+      "ec2:DeleteSecurityGroup",
+      "elasticloadbalancing:CreateLoadBalancer",
+      "elasticloadbalancing:CreateTargetGroup",
+      "elasticloadbalancing:CreateListener",
+      "elasticloadbalancing:DeleteListener",
+      "elasticloadbalancing:CreateRule",
+      "elasticloadbalancing:DeleteRule",
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:RemoveTags",
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:RemoveTags",
+      "elasticloadbalancing:ModifyLoadBalancerAttributes",
+      "elasticloadbalancing:SetIpAddressType",
+      "elasticloadbalancing:SetSecurityGroups",
+      "elasticloadbalancing:SetSubnets",
+      "elasticloadbalancing:DeleteLoadBalancer",
+      "elasticloadbalancing:ModifyTargetGroup",
+      "elasticloadbalancing:ModifyTargetGroupAttributes",
+      "elasticloadbalancing:DeleteTargetGroup",
+      "elasticloadbalancing:RegisterTargets",
+      "elasticloadbalancing:DeregisterTargets",
+      "elasticloadbalancing:SetWebAcl",
+      "elasticloadbalancing:ModifyListener",
+      "elasticloadbalancing:AddListenerCertificates",
+      "elasticloadbalancing:RemoveListenerCertificates",
+      "elasticloadbalancing:ModifyRule",
+      "s3:*"
+    ]
+
+    resources = ["*"]
+  }
+}
+
+### Policies and roles need to setup IRSA AWS ACM PCA ###
+locals {
+  k8s_aws_privateca_issuer_service_account_namespace = "platform"
+  k8s_aws_privateca_issuer_service_account_name      = "aws-privateca-issuer-${var.env}"
+}
+
+# Create a role using oidc to map service accounts
+module "iam_assumable_role_aws_privateca_issuer" {
+  source                        = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version                       = "~> v4.1.0"
+  create_role                   = true
+  role_name                     = "aws-privateca-issuer-${var.env}"
+  provider_url                  = replace(module.eks_cluster.cluster_oidc_issuer_url, "https://", "")
+  role_policy_arns              = [aws_iam_policy.aws_privateca_issuer.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:${local.k8s_aws_privateca_issuer_service_account_namespace}:${local.k8s_aws_privateca_issuer_service_account_name}"]
+}
+
+resource "aws_iam_policy" "aws_privateca_issuer" {
+  name_prefix = "aws_privateca_issuer"
+  description = "EKS AWS ACM PCA policy for cluster ${module.eks_cluster.cluster_id}"
+  policy      = data.aws_iam_policy_document.aws_privateca_issuer.json
+}
+
+data "aws_iam_policy_document" "aws_privateca_issuer" {
+
+  statement {
+    sid    = "awspcaissuer"
+    effect = "Allow"
+
+    actions = [
+      "acm-pca:DescribeCertificateAuthority",
+      "acm-pca:GetCertificate",
+      "acm-pca:IssueCertificate",
+    ]
+
+    resources = ["*"]
+  }
+}
